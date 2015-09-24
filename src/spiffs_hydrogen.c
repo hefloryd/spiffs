@@ -8,7 +8,9 @@
 #include "spiffs.h"
 #include "spiffs_nucleus.h"
 
+#if SPIFFS_CACHE == 1
 static s32_t spiffs_fflush_cache(spiffs *fs, spiffs_file fh);
+#endif
 
 #if SPIFFS_BUFFER_HELP
 u32_t SPIFFS_buffer_bytes_for_filedescs(spiffs *fs, u32_t num_descs) {
@@ -89,9 +91,10 @@ s32_t SPIFFS_mount(spiffs *fs, spiffs_config *config, u8_t *work,
   if (cache_size & (ptr_size-1)) {
     cache_size -= (cache_size & (ptr_size-1));
   }
+
 #if SPIFFS_CACHE
   fs->cache = cache;
-  fs->cache_size = (cache_size > (config->log_page_size*32)) ? config->log_page_size*32 : cache_size;
+  fs->cache_size = (cache_size > (SPIFFS_CFG_LOG_PAGE_SZ(fs)*32)) ? SPIFFS_CFG_LOG_PAGE_SZ(fs)*32 : cache_size;
   spiffs_cache_init(fs);
 #endif
 
@@ -188,6 +191,14 @@ spiffs_file SPIFFS_open(spiffs *fs, char *path, spiffs_flags flags, spiffs_mode 
     SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
   }
 
+  if (res == SPIFFS_OK &&
+      (flags & (SPIFFS_CREAT | SPIFFS_EXCL)) == (SPIFFS_CREAT | SPIFFS_EXCL)) {
+    // creat and excl and file exists - fail
+    res = SPIFFS_ERR_FILE_EXISTS;
+    spiffs_fd_return(fs, fd->file_nbr);
+    SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
+  }
+
   if ((flags & SPIFFS_CREAT) && res == SPIFFS_ERR_NOT_FOUND) {
     spiffs_obj_id obj_id;
     // no need to enter conflicting name here, already looked for it above
@@ -271,6 +282,12 @@ s32_t SPIFFS_read(spiffs *fs, spiffs_file fh, void *buf, s32_t len) {
 
   if ((fd->flags & SPIFFS_RDONLY) == 0) {
     res = SPIFFS_ERR_NOT_READABLE;
+    SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
+  }
+
+  if (fd->size == SPIFFS_UNDEFINED_LEN && len > 0) {
+    // special case for zero sized files
+    res = SPIFFS_ERR_END_OF_OBJECT;
     SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
   }
 
@@ -554,6 +571,7 @@ s32_t SPIFFS_fremove(spiffs *fs, spiffs_file fh) {
 }
 
 static s32_t spiffs_stat_pix(spiffs *fs, spiffs_page_ix pix, spiffs_file fh, spiffs_stat *s) {
+  (void)fh;
   spiffs_page_object_ix_header objix_hdr;
   spiffs_obj_id obj_id;
   s32_t res =_spiffs_rd(fs,  SPIFFS_OP_T_OBJ_IX | SPIFFS_OP_C_READ, fh,
@@ -616,7 +634,10 @@ s32_t SPIFFS_fstat(spiffs *fs, spiffs_file fh, spiffs_stat *s) {
 
 // Checks if there are any cached writes for the object id associated with
 // given filehandle. If so, these writes are flushed.
+#if SPIFFS_CACHE == 1
 static s32_t spiffs_fflush_cache(spiffs *fs, spiffs_file fh) {
+  (void)fs;
+  (void)fh;
   s32_t res = SPIFFS_OK;
 #if SPIFFS_CACHE_WR
 
@@ -645,8 +666,10 @@ static s32_t spiffs_fflush_cache(spiffs *fs, spiffs_file fh) {
 
   return res;
 }
+#endif
 
 s32_t SPIFFS_fflush(spiffs *fs, spiffs_file fh) {
+  (void)fh;
   SPIFFS_API_CHECK_CFG(fs);
   SPIFFS_API_CHECK_MOUNT(fs);
   s32_t res = SPIFFS_OK;
@@ -660,24 +683,23 @@ s32_t SPIFFS_fflush(spiffs *fs, spiffs_file fh) {
   return res;
 }
 
-void SPIFFS_close(spiffs *fs, spiffs_file fh) {
-  if (!SPIFFS_CHECK_CFG((fs))) {
-    (fs)->err_code = SPIFFS_ERR_NOT_CONFIGURED;
-    return;
-  }
+s32_t SPIFFS_close(spiffs *fs, spiffs_file fh) {
+  SPIFFS_API_CHECK_CFG(fs);
+  SPIFFS_API_CHECK_MOUNT(fs);
 
-  if (!SPIFFS_CHECK_MOUNT(fs)) {
-    fs->err_code = SPIFFS_ERR_NOT_MOUNTED;
-    return;
-  }
+  s32_t res = SPIFFS_OK;
   SPIFFS_LOCK(fs);
 
 #if SPIFFS_CACHE
-  spiffs_fflush_cache(fs, fh);
+  res = spiffs_fflush_cache(fs, fh);
+  SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
 #endif
-  spiffs_fd_return(fs, fh);
+  res = spiffs_fd_return(fs, fh);
+  SPIFFS_API_CHECK_RES_UNLOCK(fs, res);
 
   SPIFFS_UNLOCK(fs);
+
+  return res;
 }
 
 s32_t SPIFFS_rename(spiffs *fs, char *old, char *new) {
@@ -779,7 +801,7 @@ struct spiffs_dirent *SPIFFS_readdir(spiffs_DIR *d, struct spiffs_dirent *e) {
     d->fs->err_code = SPIFFS_ERR_NOT_MOUNTED;
     return 0;
   }
-  SPIFFS_LOCK(fs);
+  SPIFFS_LOCK(d->fs);
 
   spiffs_block_ix bix;
   int entry;
@@ -803,7 +825,7 @@ struct spiffs_dirent *SPIFFS_readdir(spiffs_DIR *d, struct spiffs_dirent *e) {
   } else {
     d->fs->err_code = res;
   }
-  SPIFFS_UNLOCK(fs);
+  SPIFFS_UNLOCK(d->fs);
   return ret;
 }
 
